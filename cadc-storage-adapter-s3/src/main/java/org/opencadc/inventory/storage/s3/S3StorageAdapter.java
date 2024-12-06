@@ -298,8 +298,8 @@ abstract class S3StorageAdapter implements StorageAdapter {
                                                                   .key(storageLocation.getStorageID().toASCIIString());
 
         if (byteRange != null) {
-            getObjectRequestBuilder.range("bytes=" + byteRange.getOffset() + "-" +
-                                                  (byteRange.getOffset() + byteRange.getLength() - 1));
+            final long offset = byteRange.getOffset();
+            getObjectRequestBuilder.range(String.format("bytes=%d-%d",offset, (offset + byteRange.getLength() - 1L)));
         }
 
         return s3client.getObject(getObjectRequestBuilder.build());
