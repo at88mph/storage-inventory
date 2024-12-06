@@ -73,22 +73,17 @@ import java.net.URI;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
 import java.util.UUID;
+
+import ca.nrc.cadc.net.TransientException;
 import org.apache.log4j.Logger;
 import org.opencadc.inventory.InventoryUtil;
 import org.opencadc.inventory.StorageLocation;
+import org.opencadc.inventory.storage.StorageEngageException;
 import org.opencadc.inventory.storage.StorageMetadata;
+import software.amazon.awssdk.awscore.exception.AwsServiceException;
 import software.amazon.awssdk.core.exception.SdkClientException;
-import software.amazon.awssdk.services.s3.model.BucketAlreadyExistsException;
-import software.amazon.awssdk.services.s3.model.BucketAlreadyOwnedByYouException;
-import software.amazon.awssdk.services.s3.model.CreateBucketRequest;
-import software.amazon.awssdk.services.s3.model.CreateBucketResponse;
-import software.amazon.awssdk.services.s3.model.HeadBucketRequest;
-import software.amazon.awssdk.services.s3.model.HeadBucketResponse;
-import software.amazon.awssdk.services.s3.model.ListObjectsRequest;
-import software.amazon.awssdk.services.s3.model.ListObjectsResponse;
-import software.amazon.awssdk.services.s3.model.NoSuchBucketException;
-import software.amazon.awssdk.services.s3.model.S3Exception;
-import software.amazon.awssdk.services.s3.model.S3Object;
+import software.amazon.awssdk.http.HttpStatusCode;
+import software.amazon.awssdk.services.s3.model.*;
 
 /**
  * Implementation of a Storage Adapter using the Amazon S3 API. This implementation
@@ -161,21 +156,23 @@ public class S3StorageAdapterSB extends S3StorageAdapter {
     }
     
     void initBucket() throws ResourceAlreadyExistsException, SdkClientException, S3Exception {
+        LOGGER.debug("Checking " + s3bucket + " on " + s3endpoint);
         try {
-            HeadBucketRequest headBucketRequest = HeadBucketRequest.builder().bucket(s3bucket).build();
-            HeadBucketResponse resp = s3client.headBucket(headBucketRequest);
+            s3client.getBucketAcl(builder -> builder.bucket(s3bucket));
             LOGGER.warn("found s3bucket: " + s3bucket);
             // TODO: compare current config from the config when the bucket was created
-        } catch (NoSuchBucketException nbe) {
-            try {
-                CreateBucketRequest.Builder cb = CreateBucketRequest.builder();
-                cb.bucket(s3bucket);
-                CreateBucketRequest createBucketRequest = cb.build();
-                CreateBucketResponse resp = s3client.createBucket(createBucketRequest);
-                LOGGER.warn("created s3bucket: " + s3bucket);
-                // TODO: store fresh new config
-            } catch (BucketAlreadyExistsException | BucketAlreadyOwnedByYouException ex) {
-                throw new ResourceAlreadyExistsException("Bucket already exists: " + s3bucket, ex);
+        } catch (AwsServiceException awsServiceException) {
+            if (awsServiceException.statusCode() == HttpStatusCode.NOT_FOUND) {
+                try {
+                    CreateBucketRequest.Builder cb = CreateBucketRequest.builder();
+                    cb.bucket(s3bucket);
+                    CreateBucketRequest createBucketRequest = cb.build();
+                    CreateBucketResponse resp = s3client.createBucket(createBucketRequest);
+                    LOGGER.warn("created s3bucket: " + s3bucket);
+                    // TODO: store fresh new config
+                } catch (BucketAlreadyExistsException | BucketAlreadyOwnedByYouException ex) {
+                    throw new ResourceAlreadyExistsException("Bucket already exists: " + s3bucket, ex);
+                }
             }
         }
     }
@@ -206,14 +203,9 @@ public class S3StorageAdapterSB extends S3StorageAdapter {
         return new StorageMetadataIterator(null);
     }
 
-    /**
-     * Iterator of items ordered by storage locations in matching bucket(s).
-     *
-     * @param bucketPrefix bucket constraint
-     * @return iterator ordered by storage locations
-     */
     @Override
-    public Iterator<StorageMetadata> iterator(String bucketPrefix) {
+    public Iterator<StorageMetadata> iterator(String bucketPrefix, boolean includeRecoverable)
+            throws StorageEngageException, TransientException {
         return new StorageMetadataIterator(bucketPrefix);
     }
     

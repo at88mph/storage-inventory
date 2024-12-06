@@ -89,22 +89,13 @@ import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
-import java.util.Base64;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Properties;
-import java.util.Set;
-import java.util.SortedSet;
+import java.util.*;
+
 import org.apache.log4j.Logger;
 import org.opencadc.inventory.InventoryUtil;
+import org.opencadc.inventory.Namespace;
 import org.opencadc.inventory.StorageLocation;
-import org.opencadc.inventory.storage.ByteRange;
-import org.opencadc.inventory.storage.NewArtifact;
-import org.opencadc.inventory.storage.PutTransaction;
-import org.opencadc.inventory.storage.StorageAdapter;
-import org.opencadc.inventory.storage.StorageEngageException;
-import org.opencadc.inventory.storage.StorageMetadata;
+import org.opencadc.inventory.storage.*;
 import software.amazon.awssdk.auth.credentials.AwsCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
@@ -136,7 +127,7 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
  */
 abstract class S3StorageAdapter implements StorageAdapter {
 
-    private static final Logger LOGGER = Logger.getLogger(S3StorageAdapterSB.class);
+    private static final Logger LOGGER = Logger.getLogger(S3StorageAdapter.class);
     
     private static final String CONFIG_FILENAME = "cadc-storage-adapter-s3.properties";
 
@@ -146,6 +137,7 @@ abstract class S3StorageAdapter implements StorageAdapter {
     private static final String CONF_ENDPOINT = S3StorageAdapter.class.getName() + ".endpoint";
     private static final String CONF_SBLEN = S3StorageAdapter.class.getName() + ".bucketLength";
     private static final String CONF_S3BUCKET = S3StorageAdapter.class.getName() + ".s3bucket";
+    private static final String CONF_PATH_STYLE_FLAG = S3StorageAdapter.class.getName() + ".s3pathstyle";
 
     static final int BUFFER_SIZE_BYTES = 8192;
     static final String DEFAULT_CHECKSUM_ALGORITHM = "md5";
@@ -156,6 +148,9 @@ abstract class S3StorageAdapter implements StorageAdapter {
     protected final int storageBucketLength;
     protected final String s3bucket;
     protected final S3Client s3client; // S3Client is thread safe
+
+    final List<Namespace> recoverableNamespaces = new ArrayList<>();
+    final List<Namespace> purgeNamespaces = new ArrayList<>();
     
     // ctor for unit tests that do not connect to an S3 backend
     protected S3StorageAdapter(String s3bucket, int storageBucketLength) {
@@ -175,7 +170,7 @@ abstract class S3StorageAdapter implements StorageAdapter {
             sb.append("incomplete config: ");
             boolean ok = true;
             
-            String suri = props.getProperty(CONF_ENDPOINT);
+            final String suri = props.getProperty(CONF_ENDPOINT);
             sb.append("\n\t" + CONF_ENDPOINT + ": ");
             if (suri == null) {
                 sb.append("MISSING");
@@ -196,6 +191,15 @@ abstract class S3StorageAdapter implements StorageAdapter {
             String s3b = props.getProperty(CONF_S3BUCKET);
             sb.append("\n\t" + CONF_S3BUCKET + ": ");
             if (s3b == null) {
+                sb.append("MISSING");
+                ok = false;
+            } else {
+                sb.append("OK");
+            }
+
+            final String s3PathStyle = props.getProperty(S3StorageAdapter.CONF_PATH_STYLE_FLAG);
+            sb.append("\n\t").append(S3StorageAdapter.CONF_PATH_STYLE_FLAG).append(": ");
+            if (s3PathStyle == null) {
                 sb.append("MISSING");
                 ok = false;
             } else {
@@ -224,33 +228,34 @@ abstract class S3StorageAdapter implements StorageAdapter {
                 throw new IllegalStateException(sb.toString());
             }
            
-            this.s3endpoint = new URI(suri);
+            this.s3endpoint = URI.create(suri);
             this.storageBucketLength = Integer.parseInt(sbl);
             this.s3bucket = s3b;
 
             S3ClientBuilder builder = S3Client.builder();
             // since we require the system properties used by the aws library this is not strictly necessary
-            builder.credentialsProvider(new AwsCredentialsProvider() {
+            builder.credentialsProvider(() -> new AwsCredentials() {
                 @Override
-                public AwsCredentials resolveCredentials() {
-                    return new AwsCredentials() {
-                        @Override
-                        public String accessKeyId() {
-                            return accessKey;
-                        }
+                public String accessKeyId() {
+                    return accessKey;
+                }
 
-                        @Override
-                        public String secretAccessKey() {
-                            return secretKey;
-                        }
-                    };
+                @Override
+                public String secretAccessKey() {
+                    return secretKey;
                 }
             });
-            builder.endpointOverride(s3endpoint);
-            builder.region(REGION);
-            this.s3client = builder.build();
+
+            this.s3client = builder.endpointOverride(s3endpoint)
+                                   .forcePathStyle(Boolean.parseBoolean(s3PathStyle))
+                                   .region(S3StorageAdapter.REGION)
+                                   .build();
             
             checkConnectivity();
+
+            LOGGER.debug("S3Endpoint: " + s3endpoint);
+            LOGGER.debug("S3BucketLength: " + storageBucketLength);
+            LOGGER.debug("S3RootBucket: " + s3bucket);
         } catch (Exception fatal) {
             throw new RuntimeException("invalid config", fatal);
         }
@@ -284,30 +289,35 @@ abstract class S3StorageAdapter implements StorageAdapter {
      * Obtain the InputStream for the given object. Tests can override this method.
      *
      * @param storageLocation The Storage Location of the desired object.
+     * @param byteRange The ByteRange to retrieve.  Can be null.
      * @return InputStream to the object.
      */
-    InputStream toObjectInputStream(final StorageLocation storageLocation) {
-        return s3client.getObject(GetObjectRequest.builder()
-                .bucket(toInternalBucket(storageLocation).name)
-                .key(storageLocation.getStorageID().toASCIIString())
-                .build());
+    InputStream toObjectInputStream(final StorageLocation storageLocation, final ByteRange byteRange) {
+        final GetObjectRequest.Builder getObjectRequestBuilder = GetObjectRequest.builder()
+                                                                  .bucket(toInternalBucket(storageLocation).name)
+                                                                  .key(storageLocation.getStorageID().toASCIIString());
+
+        if (byteRange != null) {
+            getObjectRequestBuilder.range("bytes=" + byteRange.getOffset() + "-" +
+                                                  (byteRange.getOffset() + byteRange.getLength() - 1));
+        }
+
+        return s3client.getObject(getObjectRequestBuilder.build());
     }
 
     /**
      * Reusable way to create a StorageMetadata object.
      *
-     * @param storageID The URI storage ID.
-     * @param bucket The bucket name for later use.
-     * @param artifactURI The Artifact URI as it is in the inventory system.
+     * @param loc The StorageLocation.
      * @param md5 The MD5 URI.
      * @param contentLength The content length in bytes.
+     * @param artifactURI The Artifact URI as it is in the inventory system.
+     * @param lastModified The last modified date of the object.
      * @return StorageMetadata instance; never null.
      */
-    StorageMetadata toStorageMetadata(StorageLocation loc, URI md5, long contentLength, 
-            final URI artifactURI, Date lastModified) {
-        StorageMetadata storageMetadata = new StorageMetadata(loc, md5, contentLength, lastModified);
-        storageMetadata.artifactURI = artifactURI;
-        return storageMetadata;
+    StorageMetadata toStorageMetadata(StorageLocation loc, URI md5, long contentLength,
+                                      final URI artifactURI, Date lastModified) {
+        return new StorageMetadata(loc, artifactURI, md5, contentLength, lastModified);
     }
 
     /**
@@ -326,7 +336,7 @@ abstract class S3StorageAdapter implements StorageAdapter {
     public void get(StorageLocation storageLocation, OutputStream dest)
             throws InterruptedException, ResourceNotFoundException, ReadException, WriteException, StorageEngageException {
         LOGGER.debug("get: " + storageLocation);
-        try (final InputStream inputStream = toObjectInputStream(storageLocation)) {
+        try (final InputStream inputStream = toObjectInputStream(storageLocation, null)) {
             MultiBufferIO tio = new MultiBufferIO();
             tio.copy(inputStream, dest);
         } catch (NoSuchBucketException | NoSuchKeyException e) {
@@ -344,7 +354,82 @@ abstract class S3StorageAdapter implements StorageAdapter {
     @Override
     public void get(StorageLocation storageLocation, OutputStream dest, ByteRange byteRange) 
         throws InterruptedException, ResourceNotFoundException, ReadException, WriteException, StorageEngageException, TransientException {
-        throw new UnsupportedOperationException();
+        LOGGER.debug("get: " + storageLocation);
+        try (final InputStream inputStream = toObjectInputStream(storageLocation, byteRange)) {
+            MultiBufferIO tio = new MultiBufferIO();
+            tio.copy(inputStream, dest);
+        } catch (NoSuchBucketException | NoSuchKeyException e) {
+            throw new ResourceNotFoundException("not found: " + storageLocation);
+        } catch (S3Exception | SdkClientException e) {
+            throw new StorageEngageException(e.getMessage(), e);
+        } catch (ReadException | WriteException e) {
+            // Handle before the IOException below so it's not wrapped into that catch.
+            throw e;
+        } catch (IOException e) {
+            throw new ReadException(e.getMessage(), e);
+        }    }
+
+    @Override
+    public void setRecoverableNamespaces(List<Namespace> list) {
+        this.recoverableNamespaces.clear();
+
+        if (list != null) {
+            this.recoverableNamespaces.addAll(list);
+        }
+    }
+
+    @Override
+    public List<Namespace> getRecoverableNamespaces() {
+        return Collections.unmodifiableList(this.recoverableNamespaces);
+    }
+
+    @Override
+    public void setPurgeNamespaces(List<Namespace> list) {
+        this.purgeNamespaces.clear();
+
+        if (list != null) {
+            this.purgeNamespaces.addAll(list);
+        }
+    }
+
+    @Override
+    public List<Namespace> getPurgeNamespaces() {
+        return Collections.unmodifiableList(this.purgeNamespaces);
+    }
+
+    @Override
+    public BucketType getBucketType() {
+        return BucketType.PLAIN;
+    }
+
+    @Override
+    public void delete(StorageLocation storageLocation, boolean b) throws ResourceNotFoundException, IOException, StorageEngageException, TransientException {
+        LOGGER.debug("delete: " + storageLocation);
+
+        try {
+            final DeleteObjectRequest.Builder deleteObjectRequestBuilder
+                    = DeleteObjectRequest.builder()
+                                         .bucket(toInternalBucket(storageLocation).name)
+                                         .key(storageLocation.getStorageID().toASCIIString());
+            s3client.deleteObject(deleteObjectRequestBuilder.build());
+        } catch (NoSuchKeyException e) {
+            throw new ResourceNotFoundException(e.getMessage(), e);
+        } catch (S3Exception e) {
+            throw new StorageEngageException(e.getMessage(), e);
+        } catch (SdkClientException e) {
+            throw new IOException(e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Iterator of items ordered by storage locations in matching bucket(s).
+     *
+     * @param bucketPrefix bucket constraint
+     * @return iterator ordered by storage locations
+     */
+    @Override
+    public Iterator<StorageMetadata> iterator(String bucketPrefix) {
+        return iterator(bucketPrefix, false);
     }
 
     // internal bucket management used for init, dynamic buckets, and intTest cleanup
@@ -362,8 +447,7 @@ abstract class S3StorageAdapter implements StorageAdapter {
     /**
      * Ensure the bucket for the given Object ID exists and return it.
      *
-     * @param storageID The Storage ID to ensure a bucket for.
-     * @return String name of the given Object's bucket.
+     * @param bucket The bucket to ensure exists.
      *
      * @throws ResourceAlreadyExistsException If the bucket needed to be created but already exists
      * @throws SdkClientException If any client side error occurs such as an IO related failure, failure to get credentials, etc.
@@ -400,7 +484,7 @@ abstract class S3StorageAdapter implements StorageAdapter {
      * The value of storageBucket in the returned StorageMetadata and StorageLocation can be used to
      * retrieve batches of artifacts in some of the iterator signatures defined in this interface.
      * Batches of artifacts can be listed by bucket in two of the iterator methods in this interface.
-     * If storageBucket is null then the caller will not be able perform bucket-based batch
+     * If storageBucket is null then the caller will not be able to perform bucket-based batch
      * validation through the iterator methods.
      *
      * @param newArtifact known information about the incoming artifact
@@ -460,8 +544,7 @@ abstract class S3StorageAdapter implements StorageAdapter {
                 // exception thrown above makes this not reachable (see TODO below)
                 try {
                     MessageDigest md = MessageDigest.getInstance(DEFAULT_CHECKSUM_ALGORITHM);
-                    DigestInputStream dis = new DigestInputStream(source, md);
-                    source = dis;
+                    source = new DigestInputStream(source, md);
                 } catch (NoSuchAlgorithmException ex) {
                     throw new RuntimeException("failed to create MessageDigest: " + DEFAULT_CHECKSUM_ALGORITHM);
                 }
@@ -561,7 +644,7 @@ abstract class S3StorageAdapter implements StorageAdapter {
     }
 
     @Override
-    public PutTransaction startTransaction(URI uri) throws StorageEngageException, TransientException {
+    public PutTransaction startTransaction(URI uri, Long aLong) throws StorageEngageException, TransientException {
         throw new UnsupportedOperationException();
     }
 
@@ -631,21 +714,7 @@ abstract class S3StorageAdapter implements StorageAdapter {
      */
     public void delete(StorageLocation storageLocation)
             throws ResourceNotFoundException, IOException, StorageEngageException, TransientException {
-        LOGGER.debug("delete: " + storageLocation);
-        
-        try {
-            final DeleteObjectRequest.Builder deleteObjectRequestBuilder 
-                = DeleteObjectRequest.builder()
-                .bucket(toInternalBucket(storageLocation).name)
-                .key(storageLocation.getStorageID().toASCIIString());
-            s3client.deleteObject(deleteObjectRequestBuilder.build());
-        } catch (NoSuchKeyException e) {
-            throw new ResourceNotFoundException(e.getMessage(), e);
-        } catch (S3Exception e) {
-            throw new StorageEngageException(e.getMessage(), e);
-        } catch (SdkClientException e) {
-            throw new IOException(e.getMessage(), e);
-        }
+        delete(storageLocation, false);
     }
 
     /**
@@ -654,7 +723,7 @@ abstract class S3StorageAdapter implements StorageAdapter {
      * using the <code>maxKeys(int)</code> call.
      * This is used by a StorageMetadata Iterator to list all objects from a bucket.
      *
-     * @param storageBucket The bucket to pull from.
+     * @param bucket The bucket to pull from.
      * @param nextMarkerKey The optional key from which to start listing the next page of objects.
      * @return ListObjectsResponse instance.
      */
@@ -666,9 +735,22 @@ abstract class S3StorageAdapter implements StorageAdapter {
         if (nextMarkerKey != null) {
             listBuilder.marker(nextMarkerKey);
         }
-        //final Optional<String> optionalNextMarkerKey = Optional.ofNullable(nextMarkerKey);
-        //optionalNextMarkerKey.ifPresent(listBuilder::marker);
 
         return s3client.listObjects(listBuilder.build());
+    }
+
+    @Override
+    public void recover(StorageLocation storageLocation, Date date) throws ResourceNotFoundException, IOException, StorageEngageException, TransientException {
+        throw new UnsupportedOperationException("recover");
+    }
+
+    @Override
+    public PutTransaction revertTransaction(String s) throws IllegalArgumentException, StorageEngageException, TransientException, UnsupportedOperationException {
+        throw new UnsupportedOperationException("reverseTransaction");
+    }
+
+    @Override
+    public Iterator<PutTransaction> transactionIterator() throws StorageEngageException, TransientException {
+        throw new UnsupportedOperationException("transactionIterator");
     }
 }

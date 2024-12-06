@@ -349,7 +349,7 @@ public class SwiftStorageAdapter  implements StorageAdapter {
         } catch (InvalidConfigException | StorageEngageException ex) {
             throw ex;
         } catch (RuntimeException ex) {
-            throw new StorageEngageException("connectiviy check failed", ex);
+            throw new StorageEngageException("connectivity check failed", ex);
         }
     }
 

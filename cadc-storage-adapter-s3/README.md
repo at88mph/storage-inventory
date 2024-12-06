@@ -40,4 +40,4 @@ The same set of properties can be used to configure both S3StorageAdapter implem
 
 The S3StorageAdapter(s) cannot support put of a file without required metadata up front (contentLength and contentChecksum).
 
-All StorageAdapter implementations are limited to 5GiB file upload. Support for larger files requires using the S3 or Swift segmented upoad feature and a facade will preobably be added to the StorageAdapter API to support that.
+All StorageAdapter implementations are limited to 5GiB file upload. Support for larger files requires using the S3 or Swift segmented upload feature and a facade will probably be added to the StorageAdapter API to support that.

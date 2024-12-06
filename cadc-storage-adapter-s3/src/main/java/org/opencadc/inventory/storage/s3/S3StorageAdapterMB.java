@@ -73,9 +73,12 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.UUID;
+
+import ca.nrc.cadc.net.TransientException;
 import org.apache.log4j.Logger;
 import org.opencadc.inventory.InventoryUtil;
 import org.opencadc.inventory.StorageLocation;
+import org.opencadc.inventory.storage.StorageEngageException;
 import org.opencadc.inventory.storage.StorageMetadata;
 import software.amazon.awssdk.services.s3.model.Bucket;
 
@@ -118,7 +121,7 @@ public class S3StorageAdapterMB extends S3StorageAdapter {
 
     @Override
     protected InternalBucket toInternalBucket(StorageLocation loc) {
-        return  new InternalBucket(toInternalBucket(loc.storageBucket));
+        return new InternalBucket(toInternalBucket(loc.storageBucket));
     }
     
     @Override
@@ -150,17 +153,12 @@ public class S3StorageAdapterMB extends S3StorageAdapter {
         return new S3StorageMetadataIteratorMB(this, null);
     }
 
-    /**
-     * Iterator of items ordered by storage locations in matching bucket(s).
-     *
-     * @param bucketPrefix bucket constraint
-     * @return iterator ordered by storage locations
-     */
     @Override
-    public Iterator<StorageMetadata> iterator(String bucketPrefix) {
+    public Iterator<StorageMetadata> iterator(String bucketPrefix, boolean includeRecoverable)
+            throws StorageEngageException, TransientException {
         return new S3StorageMetadataIteratorMB(this, bucketPrefix);
     }
-    
+
     // iterate over S3 buckets that match the specified prefix
     Iterator<InternalBucket> bucketIterator(String bucketPrefix) {
         return new BucketIterator(bucketPrefix);
@@ -202,7 +200,7 @@ public class S3StorageAdapterMB extends S3StorageAdapter {
                         keep.add(ib);
                     }
                 } else {
-                    //LOGGER.warn("BucketIterator: skip " + b.name());
+                    LOGGER.warn("BucketIterator: skip " + b.name());
                 }
             }
             //LOGGER.warn("BucketIterator: " + bucketPrefix + " " + keep.size());
